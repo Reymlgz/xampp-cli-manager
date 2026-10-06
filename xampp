@@ -1,0 +1,629 @@
+#!/bin/zsh
+# XAMPP CLI Manager — terminal launcher & manager for XAMPP on macOS (runs the Intel build via Rosetta on Apple Silicon).
+#
+#   xampp                       open the dashboard
+#   xampp start|stop|restart    control all services
+#   xampp status|check|usage    services, health check, CPU / memory / energy
+#   xampp upgrade-db            check if MySQL needs mysql_upgrade; back up and run it
+#   xampp web|pma|htdocs|logs   open localhost, phpMyAdmin, htdocs, follow the Apache error log
+#
+# Set XAMPP_NO_INTRO=1 to skip the startup animation.
+
+setopt extendedglob multibyte
+zmodload zsh/zselect 2>/dev/null
+
+XAMPP_ROOT=/Applications/XAMPP/xamppfiles
+CTL=$XAMPP_ROOT/xampp
+VERSION=$(cut -d- -f1 $XAMPP_ROOT/lib/VERSION 2>/dev/null)
+DATA=$XAMPP_ROOT/var/mysql
+ERR=$DATA/$(hostname).err
+SERVICES=(Apache MySQL ProFTPD)
+NCPU=$(sysctl -n hw.ncpu)
+typeset -A PORT=(Apache 80 MySQL 3306 ProFTPD 21)
+
+ESC=$'\e'
+N="${ESC}[0m" B="${ESC}[1m" DIM="${ESC}[38;5;240m" GR="${ESC}[38;5;246m" W="${ESC}[38;5;255m"
+O="${ESC}[38;5;208m" G="${ESC}[38;5;78m" R="${ESC}[38;5;203m" Y="${ESC}[38;5;221m"
+
+if [[ ! -x $CTL ]]; then print -r -- "${R}XAMPP not found at $XAMPP_ROOT${N}"; exit 1; fi
+
+BW=$(( $(tput cols) - 4 )); (( BW > 66 )) && BW=66     # box width
+TUI=0 ROW=0 RES_ROW=0 RES_PID= SUDO_KEEPALIVE=
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+nap()    { zselect -t $1 2>/dev/null }                        # sleep $1 hundredths of a second
+rep()    { (( $2 > 0 )) || return 0; local s; printf -v s '%*s' $2 ''; print -rn -- "${s// /$1}" }
+vlen()   { local s=${1//${ESC}\[[0-9;]#m/}; print -n ${#s} }  # visible length, ignoring colors
+center() { rep ' ' $(( (BW + 2 - $(vlen "$1")) / 2 )); print -rn -- "$1" }
+
+out()      { print -r -- "$1"; (( ROW++ )) }                  # every dashboard line goes through here
+box_top()  { local t=" $1 "; out "  ${DIM}╭─${N}${B}${O}${t}${N}${DIM}$(rep ─ $(( BW - 3 - $(vlen "$t") )))╮${N}" }
+box_line() { out "  ${DIM}│${N} $1$(rep ' ' $(( BW - 4 - $(vlen "$1") ))) ${DIM}│${N}" }
+box_sep()  { out "  ${DIM}├$(rep ─ $(( BW - 2 )))┤${N}" }
+box_bot()  { out "  ${DIM}╰$(rep ─ $(( BW - 2 )))╯${N}" }
+cls()      { ROW=0; print -n "${ESC}[H${ESC}[2J" }
+
+LOGO=(
+'██╗  ██╗ █████╗ ███╗   ███╗██████╗ ██████╗ '
+'╚██╗██╔╝██╔══██╗████╗ ████║██╔══██╗██╔══██╗'
+' ╚███╔╝ ███████║██╔████╔██║██████╔╝██████╔╝'
+' ██╔██╗ ██╔══██║██║╚██╔╝██║██╔═══╝ ██╔═══╝ '
+'██╔╝ ██╗██║  ██║██║ ╚═╝ ██║██║     ██║     '
+'╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝     ╚═╝     '
+)
+LOGO_C=(202 208 208 214 214 130)
+SUBTITLE="CLI manager  ·  v$VERSION  ·  Apache · MySQL · ProFTPD"
+
+big_screen() { (( $(tput lines) >= 38 )) }
+
+header() {
+  out ""
+  if big_screen; then
+    local i pad=$(rep ' ' $(( (BW + 2 - ${#LOGO[1]}) / 2 )))
+    for i in {1..6}; do out "$pad${ESC}[38;5;${LOGO_C[i]}m${LOGO[i]}${N}"; done
+    out "$(center "${GR}${SUBTITLE}${N}")"
+  else
+    out "  ${O}${B}▌XAMPP${N}  ${GR}CLI manager · v$VERSION${N}"
+  fi
+}
+header_small() { out ""; out "  ${O}${B}▌XAMPP${N}  ${GR}CLI manager · v$VERSION${N}"; out "" }
+
+intro() {
+  big_screen || return
+  local w=${#LOGO[1]} pad=$(rep ' ' $(( (BW + 2 - ${#LOGO[1]}) / 2 ))) i c col
+  cls
+  for (( c = 1; c <= w + 1; c += 2 )); do                    # wipe in, left to right
+    print -n "${ESC}[2;1H"
+    for i in {1..6}; do print -r -- "$pad${ESC}[38;5;${LOGO_C[i]}m${LOGO[i][1,c]}${N}"; done
+    nap 1
+  done
+  for (( c = 1; c <= w; c += 2 )); do                        # light sweep
+    print -n "${ESC}[2;1H"
+    for i in {1..6}; do
+      col="${ESC}[38;5;${LOGO_C[i]}m"
+      print -r -- "$pad$col${LOGO[i][1,c-1]}${ESC}[38;5;230m${LOGO[i][c,c+3]}$col${LOGO[i][c+4,-1]}${N}"
+    done
+    nap 1
+  done
+  print -rn -- "${ESC}[8;1H$(rep ' ' $(( (BW + 2 - ${#SUBTITLE}) / 2 )))${GR}"
+  for (( i = 1; i <= ${#SUBTITLE}; i++ )); do print -rn -- "${SUBTITLE[i]}"; (( i % 2 )) || nap 1; done
+  local bw=34 bp=$(rep ' ' $(( (BW + 2 - 34) / 2 )))
+  for (( i = 0; i <= bw; i++ )); do
+    print -rn -- "${ESC}[10;1H$bp${O}$(rep ━ $i)${DIM}$(rep ━ $(( bw - i )))${N}"; nap 1
+  done
+  nap 20
+}
+
+# ── services ─────────────────────────────────────────────────────────────────
+svc_pids() {
+  case $1 in
+    Apache)  pgrep -f "$XAMPP_ROOT/bin/httpd" ;;
+    MySQL)   pgrep -f "$XAMPP_ROOT/sbin/mysqld" ;;
+    ProFTPD) pgrep proftpd ;;            # renames itself to "proftpd: (accepting connections)"
+  esac
+}
+# Checks for a listening socket without connecting (connecting spams MySQL's log with "Aborted connection").
+port_open() { netstat -an -p tcp 2>/dev/null | awk -v p=$1 '$6 == "LISTEN" && $4 ~ "[.:]" p "$" { f = 1 } END { exit !f }' }
+
+# XAMPP decides "running or not" only from these PID files. If one goes missing while the
+# service is still up, `xampp stop` says "not running" and leaves it running.
+pidfile() {
+  case $1 in
+    Apache)  print $XAMPP_ROOT/logs/httpd.pid ;;
+    MySQL)   print $XAMPP_ROOT/var/mysql/$(hostname).pid ;;
+    ProFTPD) print $XAMPP_ROOT/var/proftpd.pid ;;
+  esac
+}
+repair_pidfiles() {                      # needs sudo
+  local s f pid
+  for s in $SERVICES; do
+    f=$(pidfile $s)
+    case $s in                           # the oldest process is the main one
+      Apache)  pid=$(pgrep -o -f "$XAMPP_ROOT/bin/httpd") ;;
+      MySQL)   pid=$(pgrep -o -f "$XAMPP_ROOT/sbin/mysqld") ;;
+      ProFTPD) pid=$(pgrep -o proftpd) ;;
+    esac
+    [[ -z $pid ]] || sudo -n test -f $f && continue
+    print -r -- $pid | sudo -n tee $f >/dev/null
+    [[ $s == MySQL ]] && sudo -n chown _mysql $f
+    print -r -- "  ${Y}●${N}  ${W}${(r:9:)s}${N} ${Y}was running without a PID file — restored it${N}"
+  done
+}
+svc_state() {                            # → up | noport | down
+  [[ -z $(svc_pids $1) ]] && { print down; return }
+  port_open ${PORT[$1]} && print up || print noport
+}
+
+svc_row() {
+  local s=$1 link line
+  case $s in Apache) link="http://localhost" ;; MySQL) link="localhost/phpmyadmin" ;; ProFTPD) link="ftp://localhost" ;; esac
+  case $(svc_state $s) in
+    up)     printf -v line "${G}●${N}  ${W}%-9s${N} ${G}%-12s${N} ${GR}:%-5s${N}  ${GR}%s${N}" $s running ${PORT[$s]} $link ;;
+    noport) printf -v line "${Y}●${N}  ${W}%-9s${N} ${Y}%-12s${N} ${GR}:%-5s${N}  ${DIM}%s${N}" $s "no response" ${PORT[$s]} "port not answering" ;;
+    down)   printf -v line "${R}●${N}  ${W}%-9s${N} ${R}%-12s${N} ${DIM}:%-5s${N}" $s stopped ${PORT[$s]} ;;
+  esac
+  box_line "$line"
+}
+
+# ── resources (CPU / memory / energy via top, sampled over 1 s) ─────────────
+measure() {                              # → "service procs cpu memMB energy" per line
+  local -a args; local map="" s pid
+  for s in $SERVICES; do
+    for pid in ${(f)"$(svc_pids $s)"}; do [[ -n $pid ]] && { args+=(-pid $pid); map+="$pid:$s " }; done
+  done
+  args+=(-pid $$); map+="$$:CLI "
+  top -l 2 -s 1 -stats pid,cpu,mem,power $args 2>/dev/null | awk -v map="$map" -v ncpu=$NCPU '
+    BEGIN { n = split(map, a, " "); for (i = 1; i <= n; i++) { split(a[i], b, ":"); svc[b[1]] = b[2] } }
+    /^PID/ { h++; next }
+    h == 2 && ($1 in svc) {
+      s = svc[$1]; m = $3; sub(/[+-]$/, "", m); u = substr(m, length(m)); v = m + 0
+      if (u == "K") v /= 1024; else if (u == "G") v *= 1024; else if (u == "B") v /= 1048576
+      k[s]++; c[s] += $2; mem[s] += v; p[s] += $4
+    }
+    END { for (s in k) printf "%s %d %.1f %.1f %.1f\n", s, k[s], c[s] / ncpu, mem[s], p[s] }'
+}
+fmt_mem() { (( $1 >= 1024 )) && printf "%.2f GB" $(( $1 / 1024.0 )) || printf "%.1f MB" $1 }
+level()   { (( $1 >= $3 )) && print -rn -- $R || { (( $1 >= $2 )) && print -rn -- $Y || print -rn -- $G } }
+
+res_header() { local l; printf -v l "${DIM}%-12s %5s %9s %11s %9s${N}" SERVICE PROCS CPU MEMORY ENERGY; box_line "$l" }
+res_rows() {                             # $1 = placeholder → "measuring…" rows
+  local -A K C M P; local s k c m p label line
+  typeset -F tc=0 tm=0 tp=0
+  if [[ $1 != placeholder ]]; then
+    while read -r s k c m p; do [[ -n $s ]] && K[$s]=$k C[$s]=$c M[$s]=$m P[$s]=$p; done <<< "$(measure)"
+  fi
+  for s in $SERVICES CLI; do
+    label=$s; [[ $s == CLI ]] && label="this panel"
+    if [[ $1 == placeholder ]]; then
+      printf -v line "${W}%-12s${N} ${DIM}%s${N}" $label "measuring…"
+    elif [[ -z ${K[$s]} ]]; then
+      printf -v line "${DIM}%-12s %5s %9s %11s %9s${N}" $label – – – –
+    else
+      (( tc += ${C[$s]}, tm += ${M[$s]}, tp += ${P[$s]} ))
+      printf -v line "${W}%-12s${N} ${GR}%5s${N} %s%9s${N} ${W}%11s${N} %s%9s${N}" \
+        $label ${K[$s]} "$(level ${C[$s]} 5 20)" "${C[$s]}%" "$(fmt_mem ${M[$s]})" "$(level ${P[$s]} 20 50)" ${P[$s]}
+    fi
+    box_line "$line"
+  done
+  box_sep
+  if [[ $1 == placeholder ]]; then
+    printf -v line "${B}%-12s${N}" Total
+  else
+    printf -v line "${B}%-12s${N} %5s %s%9s${N} ${B}${W}%11s${N} %s%9s${N}" \
+      Total "" "$(level $tc 5 20)" "$(printf %.1f $tc)%" "$(fmt_mem $tm)" "$(level $tp 20 50)" "$(printf %.1f $tp)"
+  fi
+  box_line "$line"
+}
+res_async() {                            # measure in the background, then paint the rows in place
+  trap - EXIT INT
+  local lines=("${(@f)$(res_rows)}") i
+  print -n "${ESC}7"
+  for (( i = 1; i <= ${#lines}; i++ )); do print -rn -- "${ESC}[$(( RES_ROW + i - 1 ));1H${lines[i]}"; done
+  print -n "${ESC}8"
+}
+stop_async() { [[ -n $RES_PID ]] && kill $RES_PID 2>/dev/null; RES_PID= }
+
+# ── logs & diagnostics ───────────────────────────────────────────────────────
+# Shortens Apache's timestamps, colors errors red / warnings yellow, adds a gutter.
+LOGFMT='
+  /^\[/ { t = substr($0, 13, 8); sub(/^\[[^]]*\] /, ""); gsub(/ ?\[pid [0-9]+[^]]*\]/, ""); $0 = t " " $0 }
+  { c = "\033[38;5;246m"; l = tolower($0)
+    if (l ~ /:(error|crit|alert|emerg)\]|\[error\]|fatal/) c = "\033[38;5;203m"; else if (l ~ /:warn\]|\[warning\]/) c = "\033[38;5;221m"
+    print "  " g "┃\033[0m " c substr($0, 1, w) "\033[0m"; fflush() }'
+logfmt() { awk -v w=$(( $(tput cols) - 8 )) -v g="${1:-$R}" "$LOGFMT" }
+
+port_hint() {
+  local p owner pid name ports=(${PORT[$1]})
+  [[ $1 == Apache ]] && ports+=(443)
+  for p in $ports; do
+    owner=$( { sudo -n lsof -nP -iTCP:$p -sTCP:LISTEN 2>/dev/null || lsof -nP -iTCP:$p -sTCP:LISTEN 2>/dev/null } | awk 'NR==2 {print $1, $2}')
+    [[ -z $owner ]] && continue
+    pid=${owner#* } name=${owner% *}
+    svc_pids $1 | grep -qx $pid && continue
+    print -r -- "  ${Y}!${N}  Port ${B}$p${N} is taken by ${B}$name${N} ${GR}(pid $pid)${N} — close that program and try again."
+  done
+}
+
+diagnose() {
+  local f
+  print
+  case $1 in
+    Apache)
+      print -r -- "  ${R}┃${N} ${B}Apache${N}  ${DIM}logs/error_log${N}"
+      tail -n 8 $XAMPP_ROOT/logs/error_log 2>/dev/null | logfmt ;;
+    MySQL)
+      f=var/mysql/$(hostname).err
+      print -r -- "  ${R}┃${N} ${B}MySQL${N}  ${DIM}$f${N}"
+      sudo -n tail -n 8 $XAMPP_ROOT/$f 2>/dev/null | logfmt ;;
+    ProFTPD)
+      print -r -- "  ${R}┃${N} ${B}ProFTPD${N}  ${DIM}var/proftpd/start.err${N}"
+      sudo -n tail -n 8 $XAMPP_ROOT/var/proftpd/start.err 2>/dev/null | logfmt ;;
+  esac
+  port_hint $1
+}
+
+# ── actions ──────────────────────────────────────────────────────────────────
+ensure_sudo() {
+  if ! sudo -n true 2>/dev/null; then
+    print -n "${ESC}[?25h"
+    sudo -v -p "  ${Y}●${N} Admin password: " || { print -r -- "  ${R}✖ Cancelled${N}"; return 1 }
+    (( TUI )) && print -n "${ESC}[?25l"
+    print
+  fi
+  if [[ -z $SUDO_KEEPALIVE ]]; then
+    ( trap - EXIT INT; while kill -0 $$ 2>/dev/null; do sudo -n -v 2>/dev/null; sleep 50; done ) &
+    SUDO_KEEPALIVE=$!
+  fi
+}
+
+# Turns xampp's "XAMPP: Starting Apache...ok." lines into ✔ / ● / ✖ rows.
+report() {
+  local re='^XAMPP: +(Starting|Stopping) ([A-Za-z]+)\.\.\.(.*)$' line verb s res name skip=0
+  local -a failed
+  while IFS= read -r line; do
+    if [[ $line =~ $re ]]; then
+      verb=$match[1] s=$match[2] res=$match[3] skip=0
+      printf -v name "${W}%-9s${N}" $s
+      case $res in
+        ok*)           [[ $verb == Starting ]] && print -r -- "  ${G}✔${N}  $name ${G}started${N}" \
+                                               || print -r -- "  ${G}✔${N}  $name ${GR}stopped${N}" ;;
+        already*)      print -r -- "  ${G}●${N}  $name ${GR}already running${N}" ;;
+        not\ running*) print -r -- "  ${DIM}○${N}  $name ${GR}was not running${N}" ;;
+        fail*)         failed+=($s)
+                       [[ $verb == Starting ]] && verb=start || verb=stop
+                       print -r -- "  ${R}✖${N}  $name ${R}failed to $verb${N}" ;;
+        *)             print -r -- "  ${Y}●${N}  $name ${Y}$res${N}" ;;
+      esac
+    elif [[ $line == (Last\ *\ lines\ of|Contents\ of)* ]]; then
+      skip=1                             # xampp dumps a log here; diagnose() shows it formatted
+    elif (( ! skip )) && [[ -n ${line//[[:space:]]/} && $line != *XAMPP\ for* ]]; then
+      print -r -- "     ${GR}${line##XAMPP:[[:space:]]#}${N}"
+    fi
+  done < $1
+
+  print
+  if (( ${#failed} )); then
+    print -r -- "  ${R}${B}Something went wrong.${N} ${GR}Recent log lines:${N}"
+    for s in $failed; do diagnose $s; done
+  else
+    print -r -- "  ${G}${B}Done.${N}"
+  fi
+}
+
+# XAMPP's own MySQL stop is broken on macOS: bin/mysql.server runs `su - mysql -s /bin/sh -c kill`,
+# which always fails here, so it decides MySQL "isn't running", deletes the PID file, reports ok,
+# and leaves mysqld running. We send the same shutdown signal directly and wait for it to exit.
+# Prints xampp-style lines so report() can parse them.
+mysql_stop() {
+  local pid=$(pgrep -o -f "$XAMPP_ROOT/sbin/mysqld") i
+  if [[ -z $pid ]]; then print "XAMPP: Stopping MySQL...not running."; return 0; fi
+  sudo -n kill -TERM $pid
+  for i in {1..60}; do
+    pgrep -f "$XAMPP_ROOT/sbin/mysqld" >/dev/null || { print "XAMPP: Stopping MySQL...ok."; return 0 }
+    sleep 0.5
+  done
+  print "XAMPP: Stopping MySQL...fail."; print "MySQL did not shut down within 30 seconds."
+  return 1
+}
+
+action() {                               # $1 title, $2 xampp subcommand
+  stop_async
+  (( TUI )) && { cls; header_small }
+  print -r -- "  ${B}${W}$1${N}"; print
+  ensure_sudo || return 1
+  repair_pidfiles
+  local tmp=$(mktemp -t xampp) i=1 frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  (
+    trap - EXIT INT
+    case $2 in
+      stopmysql)    mysql_stop >$tmp ;;
+      stop|restart) mysql_stop >$tmp     # xampp's stop then finds MySQL gone; drop its duplicate line
+                    sudo -n $CTL $2 2>&1 | grep -v 'Stopping MySQL\.\.\.not running' >>$tmp ;;
+      *)            sudo -n $CTL $2 >$tmp 2>&1 ;;
+    esac
+    touch $tmp.done
+  ) &
+  while [[ ! -e $tmp.done ]]; do
+    print -rn -- $'\r'"  ${O}${frames[i]}${N} ${GR}working…${N}"; i=$(( i % 10 + 1 )); nap 8
+  done
+  print -rn -- $'\r'"${ESC}[K"
+  report $tmp
+  rm -f $tmp $tmp.done
+}
+
+health() {
+  stop_async
+  (( TUI )) && { cls; header_small }
+  print -r -- "  ${B}${W}Health check${N}"; print
+  local s code n problems=0 name
+  local -A st
+  for s in $SERVICES; do
+    st[$s]=$(svc_state $s)
+    printf -v name "${W}%-9s${N}" $s
+    case ${st[$s]} in
+      up)     print -r -- "  ${G}✔${N}  $name ${GR}running on port ${PORT[$s]}${N}"
+              if [[ ! -f $(pidfile $s) ]]; then
+                print -r -- "     ${Y}!${N} ${Y}PID file missing — XAMPP thinks it's stopped and can't stop it.${N}"
+                print -r -- "       ${GR}Any start/stop/restart in this panel restores it.${N}"
+                (( problems++ ))
+              fi ;;
+      noport) print -r -- "  ${Y}!${N}  $name ${Y}running, but port ${PORT[$s]} is not answering${N}"; (( problems++ )) ;;
+      down)   print -r -- "  ${R}●${N}  $name ${R}stopped${N}" ;;
+    esac
+  done
+  print
+  if [[ ${st[Apache]} == up ]]; then
+    for s in Website:/ phpMyAdmin:/phpmyadmin/; do
+      code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://localhost${s#*:})
+      printf -v name "${W}%-22s${N}" ${s%%:*}
+      if [[ $code == [23]* ]]; then print -r -- "  ${G}✔${N}  $name ${GR}HTTP $code${N}"
+      else print -r -- "  ${R}✖${N}  $name ${R}HTTP ${code:-no response}${N}"; (( problems++ )); fi
+    done
+  fi
+  if [[ ${st[MySQL]} == up ]]; then
+    if $XAMPP_ROOT/bin/mysqladmin --connect-timeout=2 -h 127.0.0.1 ping >/dev/null 2>&1
+    then print -r -- "  ${G}✔${N}  ${W}MySQL connection${N}       ${GR}accepting connections${N}"
+    else print -r -- "  ${R}✖${N}  ${W}MySQL connection${N}       ${R}not accepting connections${N}"; (( problems++ )); fi
+    local server=$($XAMPP_ROOT/bin/mysql -u root -N -e 'select version()' 2>/dev/null)
+    if [[ -n $server && -n $(upgrade_reasons $server) ]]; then
+      print -r -- "  ${Y}!${N}  ${W}MySQL system tables${N}    ${Y}upgrade recommended — press u${N}"; (( problems++ ))
+    elif [[ -n $server ]]; then
+      print -r -- "  ${G}✔${N}  ${W}MySQL system tables${N}    ${GR}up to date ($server)${N}"
+    fi
+  fi
+  n=$(tail -n 300 $XAMPP_ROOT/logs/error_log 2>/dev/null | grep -cE '\[[a-z_]*:(error|crit|alert|emerg)\]')
+  if (( n )); then
+    print -r -- "  ${Y}!${N}  ${W}Apache log${N}             ${Y}$n recent error(s)${N}"; (( problems++ ))
+  else
+    print -r -- "  ${G}✔${N}  ${W}Apache log${N}             ${GR}no recent errors${N}"
+  fi
+
+  # Logs only when something is actually wrong.
+  [[ ${st[Apache]} == noport ]] || [[ ${st[Apache]} == up && $code != [23]* ]] && diagnose Apache
+  [[ ${st[MySQL]} == noport ]] && diagnose MySQL
+  if (( n )); then
+    print; print -r -- "  ${Y}┃${N} ${B}Recent Apache errors${N}"
+    tail -n 300 $XAMPP_ROOT/logs/error_log | grep -E '\[[a-z_]*:(error|crit|alert|emerg)\]' | tail -n 5 | logfmt $Y
+  fi
+  for s in $SERVICES; do [[ ${st[$s]} == down ]] && port_hint $s; done
+
+  print
+  (( problems )) && print -r -- "  ${Y}${B}$problems problem(s) found.${N}" || print -r -- "  ${G}${B}Everything looks good.${N}"
+}
+
+live_log() {
+  stop_async
+  cls; header_small
+  print -r -- "  ${B}${W}Apache error log${N}  ${GR}live · Ctrl-C to return${N}"; print
+  trap ':' INT
+  tail -n 15 -f $XAMPP_ROOT/logs/error_log | logfmt $DIM
+  trap 'exit 130' INT
+}
+
+# ── MySQL upgrade (mysql_upgrade with backup) ────────────────────────────────
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+spin() {                                 # $1 label, rest = command; shows a spinner, then ✔ / ✖
+  local label=$1 tmp=$(mktemp -t xampp) i=1 rc; shift
+  ( trap - EXIT INT; "$@" >$tmp 2>&1; print $? >$tmp.rc.part; mv $tmp.rc.part $tmp.rc ) &
+  while [[ ! -e $tmp.rc ]]; do
+    print -rn -- $'\r'"  ${O}${SPIN[i]}${N} ${GR}$label…${N}${ESC}[K"; i=$(( i % 10 + 1 )); nap 8
+  done
+  rc=$(<$tmp.rc)
+  if (( rc == 0 )); then
+    print -r -- $'\r'"${ESC}[K  ${G}✔${N}  $label"
+  else
+    print -r -- $'\r'"${ESC}[K  ${R}✖${N}  $label ${R}failed${N}"
+    tail -n 6 $tmp | while IFS= read -r l; do print -r -- "     ${GR}$l${N}"; done
+  fi
+  rm -f $tmp $tmp.rc
+  return $rc
+}
+
+# Why an upgrade is needed, one reason per line (empty = not needed). $1 = server version.
+upgrade_reasons() {
+  local info= n
+  [[ -r $DATA/mysql_upgrade_info ]] && info=${${$(<$DATA/mysql_upgrade_info)//$'\0'/}//[^[:print:]]/}
+  [[ -z $info ]] && print "mysql_upgrade has never been run on this data"
+  [[ -n $info && $info != $1 ]] && print "system tables are from $info, the server is $1"
+  n=$(awk '/mysqld_safe Starting/ { n = 0 } /Incorrect definition of table mysql\./ { n++ } END { print n + 0 }' $ERR 2>/dev/null)
+  (( n )) && print "$n system-table errors in the log since MySQL last started"
+}
+
+wait_mysql()    { local i; for i in {1..30}; do $XAMPP_ROOT/bin/mysqladmin -u root ping >/dev/null 2>&1 && return 0; sleep 1; done; return 1 }
+start_mysql()   { sudo -n $CTL startmysql && wait_mysql }
+restart_mysql() { mysql_stop && start_mysql }
+backup_data()   { sudo -n ditto $DATA $1 && sudo -n diff -rq $DATA $1 }
+check_tables()  {                        # prints only tables that are not OK
+  local out; out=$($XAMPP_ROOT/bin/mysqlcheck -u root --all-databases 2>&1) || { print -r -- $out; return 1 }
+  out=$(print -r -- $out | grep -v ' OK$')
+  [[ -z $out ]] || { print -r -- $out; return 1 }
+}
+alert() { print -r -- "  ${Y}▲${N}  $1" }
+
+db_fail() {                              # $1 message, $2 backup folder (if one was made)
+  print; print -r -- "  ${R}${B}✖ $1${N}"
+  diagnose MySQL
+  if [[ -n $2 ]]; then
+    print; print -r -- "  ${W}Your backup is safe:${N} ${2/#$HOME/~}"
+    print -r -- "  ${GR}To go back to it: stop MySQL (key 8), then run in a terminal:${N}"
+    print -r -- "  ${W}sudo mv $DATA $DATA.broken && sudo ditto $2 $DATA${N}"
+  fi
+}
+
+db_upgrade() {
+  stop_async
+  (( TUI )) && { cls; header_small }
+  print -r -- "  ${B}${W}Upgrade MySQL system tables${N}  ${GR}mysql_upgrade${N}"; print
+
+  # 1. Is it needed?
+  if [[ $(svc_state MySQL) != up ]]; then
+    print -r -- "  ${Y}●${N}  MySQL has to be running to check. Start it first ${GR}(key 7)${N}."; return 1
+  fi
+  local server=$($XAMPP_ROOT/bin/mysql -u root -N -e 'select version()' 2>&1) pw k reasons r
+  if [[ $server == *"Access denied"* ]]; then
+    print -n "${ESC}[?25h"; read -s "pw?  ${Y}●${N} MySQL root password: "; print
+    (( TUI )) && print -n "${ESC}[?25l"
+    export MYSQL_PWD=$pw
+    server=$($XAMPP_ROOT/bin/mysql -u root -N -e 'select version()' 2>&1)
+  fi
+  if [[ $server != [0-9]* ]]; then print -r -- "  ${R}✖${N}  Can't log in to MySQL: ${GR}$server${N}"; return 1; fi
+
+  reasons=$(upgrade_reasons $server)
+  if [[ -z $reasons ]]; then
+    print -r -- "  ${G}✔${N}  ${W}No upgrade needed.${N}"
+    print -r -- "     ${GR}System tables match MariaDB $server and the log has no system-table errors.${N}"
+    return 0
+  fi
+  print -r -- "  ${Y}!${N}  ${W}An upgrade is recommended:${N}"
+  for r in ${(f)reasons}; do print -r -- "     ${GR}• $r${N}"; done
+  print
+
+  # 2. Warn and confirm
+  ensure_sudo || return 1
+  local need=$(sudo -n du -sk $DATA | cut -f1) free=$(df -k $HOME | awk 'NR == 2 { print $4 }')
+  local err_kb=$(( $(stat -f %z $ERR 2>/dev/null || print 0) / 1024 ))
+  if (( free < need * 2 )); then
+    print -r -- "  ${R}✖${N}  Not enough free disk space for the backup ${GR}(needs about $(( need / 1024 )) MB)${N}."; return 1
+  fi
+  print -r -- "  ${Y}${B}Before you continue${N}"
+  alert "MySQL will be ${B}stopped for about a minute${N} — your apps and phpMyAdmin can't reach the database meanwhile."
+  alert "A full backup of the data folder ${GR}($(( need / 1024 )) MB)${N} goes to ${W}~/Backups${N} and is verified before anything changes."
+  alert "Only MariaDB's internal tables are repaired. Your data and your htdocs files aren't modified."
+  alert "Don't close this window or let the Mac sleep until it says ${G}Done${N}."
+  print
+  print -rn -- "  Upgrade now? ${B}y${N} / ${B}N${N} "
+  read -s -k 1 k; print
+  if [[ $k != [yY] ]]; then print -r -- "  ${GR}Cancelled — nothing was changed.${N}"; return 0; fi
+  print
+
+  # 3. Run it, stopping at the first failure
+  local bk=~/Backups/xampp-mysql-$(date +%Y-%m-%d-%H%M)
+  mkdir -p ~/Backups
+  spin "Stopping MySQL" mysql_stop \
+    || { db_fail "MySQL didn't stop. Nothing was changed."; return 1 }
+  spin "Backing up and verifying ${bk/#$HOME/~}" backup_data $bk \
+    || { spin "Starting MySQL again" start_mysql; db_fail "The backup failed. Nothing was changed."; return 1 }
+  if (( err_kb > 5120 )); then
+    spin "Moving the $(( err_kb / 1024 )) MB error log into the backup" sudo -n mv $ERR $bk/old-error-log.err
+  fi
+  spin "Starting MySQL" start_mysql \
+    || { db_fail "MySQL didn't start." $bk; return 1 }
+  spin "Running mysql_upgrade" sudo -n env MYSQL_PWD="$MYSQL_PWD" $XAMPP_ROOT/bin/mysql_upgrade -u root \
+    || { db_fail "mysql_upgrade failed." $bk; return 1 }
+  spin "Restarting MySQL to confirm a clean start" restart_mysql \
+    || { db_fail "MySQL didn't come back after the upgrade." $bk; return 1 }
+  spin "Checking every table" check_tables \
+    || { db_fail "Some tables reported problems (listed above)." $bk; return 1 }
+
+  reasons=$(upgrade_reasons $server)
+  if [[ -n $reasons ]]; then
+    for r in ${(f)reasons}; do print -r -- "     ${Y}• $r${N}"; done
+    db_fail "The upgrade ran, but the issues above remain." $bk; return 1
+  fi
+  print
+  print -r -- "  ${G}${B}Done.${N} ${GR}System tables are up to date and MySQL started cleanly.${N}"
+  print -r -- "  ${GR}Backup kept at ${W}${bk/#$HOME/~}${GR}. Once everything works for a few days, delete it with:${N}"
+  print -r -- "  ${W}sudo rm -rf $bk${N}"
+}
+
+# ── dashboard ────────────────────────────────────────────────────────────────
+key()  { printf "${ESC}[48;5;208m${ESC}[38;5;232m${B} %s ${N} %-12s " $1 $2 }
+grp()  { printf "${GR}%-9s${N}" $1 }
+
+dashboard() {
+  stop_async
+  cls
+  header
+  out ""
+  box_top Services
+  for s in $SERVICES; do svc_row $s; done
+  box_bot
+  box_top Actions
+  box_line "$(grp All)$(key 1 Start)$(key 2 Stop)$(key 3 Restart)"
+  box_line "$(grp Apache)$(key 4 Start)$(key 5 Stop)$(key 6 Restart)"
+  box_line "$(grp MySQL)$(key 7 Start)$(key 8 Stop)"
+  box_line "$(grp ProFTPD)$(key 9 Start)$(key 0 Stop)"
+  box_line "$(grp Open)$(key w Website)$(key p phpMyAdmin)$(key h htdocs)"
+  box_line "$(grp Tools)$(key c 'Health check')$(key u 'Upgrade DB')$(key l 'Live log')"
+  box_line "$(grp '')$(key r Refresh)$(key q Quit)"
+  box_bot
+  box_top Resources
+  res_header
+  RES_ROW=$(( ROW + 1 ))
+  res_rows placeholder
+  box_line "${DIM}CPU = % of whole Mac ($NCPU cores) · energy = macOS Energy Impact${N}"
+  box_bot
+  out ""
+  print -rn -- "  ${O}❯${N} ${GR}press a key${N}"
+  local shift=$(( ROW + 1 - $(tput lines) ))
+  (( shift > 0 )) && (( RES_ROW -= shift ))
+  (( RES_ROW >= 1 )) && { res_async & RES_PID=$! }
+}
+
+cleanup() {
+  stop_async
+  [[ -n $SUDO_KEEPALIVE ]] && kill $SUDO_KEEPALIVE 2>/dev/null
+  if (( TUI )); then
+    print -n "${ESC}[?1049l${ESC}[?25h"
+    local s line="  ${O}${B}▌XAMPP${N} "
+    for s in $SERVICES; do
+      case $(svc_state $s) in up) line+=" ${G}●${N} $s" ;; noport) line+=" ${Y}●${N} $s" ;; *) line+=" ${R}●${N} $s" ;; esac
+    done
+    print -r -- "$line"
+    print -r -- "  ${GR}Services keep running in the background — run ${W}xampp${GR} anytime.${N}"
+  fi
+}
+trap cleanup EXIT
+
+# ── direct commands: `xampp start` ───────────────────────────────────────────
+if [[ -n $1 ]]; then
+  case $1 in
+    start)   action "Starting all services" start ;;
+    stop)    action "Stopping all services" stop ;;
+    restart) action "Restarting all services" restart ;;
+    startapache|stopapache|restartapache|startmysql|stopmysql|startftp|stopftp) action "xampp $1" $1 ;;
+    status)  box_top Services; for s in $SERVICES; do svc_row $s; done; box_bot ;;
+    check)   health ;;
+    upgrade-db) db_upgrade ;;
+    usage)   box_top Resources; res_header; res_rows; box_bot ;;
+    web)     open http://localhost/ ;;
+    pma)     open http://localhost/phpmyadmin/ ;;
+    htdocs)  open $XAMPP_ROOT/htdocs ;;
+    logs)    tail -n 15 -f $XAMPP_ROOT/logs/error_log | logfmt $DIM ;;
+    *)       print "Usage: xampp [start|stop|restart|status|check|usage|upgrade-db|web|pma|htdocs|logs]"; exit 1 ;;
+  esac
+  exit
+fi
+
+# ── interactive dashboard ────────────────────────────────────────────────────
+TUI=1
+trap 'exit 130' INT TERM
+print -n "${ESC}[?1049h${ESC}[?25l"      # alternate screen, hidden cursor
+[[ -z $XAMPP_NO_INTRO ]] && intro
+
+while true; do
+  dashboard
+  read -s -k 1 key || exit
+  case $key in
+    1) action "Starting all services"   start ;;
+    2) action "Stopping all services"   stop ;;
+    3) action "Restarting all services" restart ;;
+    4) action "Starting Apache"   startapache ;;
+    5) action "Stopping Apache"   stopapache ;;
+    6) action "Restarting Apache" restartapache ;;
+    7) action "Starting MySQL"    startmysql ;;
+    8) action "Stopping MySQL"    stopmysql ;;
+    9) action "Starting ProFTPD"  startftp ;;
+    0) action "Stopping ProFTPD"  stopftp ;;
+    c) health ;;
+    u) db_upgrade ;;
+    l) live_log ;;
+    w) open http://localhost/; continue ;;
+    p) open http://localhost/phpmyadmin/; continue ;;
+    h) open $XAMPP_ROOT/htdocs; continue ;;
+    q|Q) exit 0 ;;
+    *) continue ;;
+  esac
+  print; print -rn -- "  ${GR}Press any key to return…${N}"
+  read -s -k 1
+done
